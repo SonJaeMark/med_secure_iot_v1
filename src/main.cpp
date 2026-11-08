@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 // Pin Definitions
 const int stepPin = 25;
@@ -9,10 +12,17 @@ const int irSensorPin = 18;      // IR sensor digital output
 const int endSwitchPin = 19;     // End switch (empty dispenser)
 const int startSwitchPin = 21;   // Start switch (fully stacked dispenser)
 
+// Machine ID
+const String machineId = "MSv1M-001";
+
 // Motor configuration & Inversion Helper Flag
-const int stepsPerRevolution = 200; // 1.8 deg per step for 42BYGHW616
-const bool INVERT_MOTOR_DIRECTION = false; // Set to true if physical wiring requires inverted movement
+const int stepsPerRevolution = 200; 
+const bool INVERT_MOTOR_DIRECTION = false; 
 bool systemBusy = false;
+
+// Web Server on port 80
+WebServer server(80);
+Preferences preferences;
 
 // Helper method for easy motor direction switching
 void setMotorDirection(bool forward) {
@@ -26,6 +36,9 @@ void setMotorDirection(bool forward) {
 // Forward declarations
 void executeDispenseCycle();
 void executeCalibrationCycle();
+void handleApiDispense();
+void handleRoot();
+void handleSaveCreds();
 
 void setup() {
   Serial.begin(115200);
@@ -34,17 +47,58 @@ void setup() {
   pinMode(stepPin, OUTPUT);
   pinMode(dirPin, OUTPUT);
   
-  // Configure inputs with internal pull-ups (Buttons/Switches pull LOW when pressed/triggered)
+  // Configure inputs with internal pull-ups
   pinMode(dispenseButtonPin, INPUT_PULLUP);
   pinMode(calButtonPin, INPUT_PULLUP);
   pinMode(irSensorPin, INPUT);
   pinMode(startSwitchPin, INPUT_PULLUP);
   pinMode(endSwitchPin, INPUT_PULLUP);
 
+  // Load saved Wi-Fi credentials
+  preferences.begin("wifi-config", false);
+  String ssid = preferences.getString("ssid", "");
+  String password = preferences.getString("password", "");
+
+  if (ssid.length() > 0) {
+    Serial.printf("Connecting to saved WiFi: %s\n", ssid.c_str());
+    WiFi.begin(ssid.c_str(), password.c_str());
+    
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+  }
+
+  // If connection fails, spin up AP Hotspot for configuration
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nStarting AP Hotspot for Setup...");
+    WiFi.softAP("MedDispenser-Setup-" + machineId);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+
+    server.on("/", handleRoot);
+    server.on("/save", HTTP_POST, handleSaveCreds);
+  } else {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Setup API endpoint once connected
+    server.on("/api/dispense", HTTP_POST, handleApiDispense);
+    server.on("/api/status", HTTP_GET, []() {
+      server.send(200, "application/json", "{\"machineId\":\"" + machineId + "\", \"status\":\"online\"}");
+    });
+  }
+
+  server.begin();
   Serial.println("Med Dispenser Initialized. Ready.");
 }
 
 void loop() {
+  server.handleClient();
+
   if (systemBusy) {
     return;
   }
@@ -66,8 +120,44 @@ void loop() {
   }
 }
 
+void handleRoot() {
+  String html = "<html><body>";
+  html += "<h2>Med Dispenser Setup (" + machineId + ")</h2>";
+  html += "<form action=\"/save\" method=\"POST\">";
+  html += "SSID:<br><input type=\"text\" name=\"ssid\"><br>";
+  html += "Password:<br><input type=\"password\" name=\"password\"><br><br>";
+  html += "<input type=\"submit\" value=\"Save & Connect\">";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSaveCreds() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+
+  server.send(200, "text/html", "<h3>Credentials Saved! Restarting device...</h3>");
+  delay(2000);
+  ESP.restart();
+}
+
+void handleApiDispense() {
+  if (systemBusy) {
+    server.send(503, "application/json", "{\"error\":\"System busy\"}");
+    return;
+  }
+
+  Serial.println("API Dispense command received.");
+  systemBusy = true;
+  executeDispenseCycle();
+  systemBusy = false;
+
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Dispense cycle completed\",\"machineId\":\"" + machineId + "\"}");
+}
+
 void executeDispenseCycle() {
-  // --- STEP 1: DISPENSE (Rotate Forward) ---
   setMotorDirection(true); // Set forward direction
   Serial.println("Dispensing...");
 
@@ -93,29 +183,28 @@ void executeDispenseCycle() {
 
   delay(500);
 
-  // // --- STEP 2: REFILL / RETURN (Rotate Reverse) ---
-  // setMotorDirection(false); // Set reverse direction
-  // Serial.println("Returning to starting position...");
+  // --- STEP 2: REFILL / RETURN (Rotate Reverse) ---
+  setMotorDirection(false); // Set reverse direction
+  Serial.println("Returning to starting position...");
 
-  // while (true) {
-  //   digitalWrite(stepPin, HIGH);
-  //   delayMicroseconds(1000);
-  //   digitalWrite(stepPin, LOW);
-  //   delayMicroseconds(1000);
+  while (true) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(1000);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(1000);
 
-  //   // Check if start end switch is reached (Pin 21 - fully stacked dispenser)
-  //   if (digitalRead(startSwitchPin) == LOW) {
-  //     Serial.println("Start position reached. Motor stopped.");
-  //     break;
-  //   }
-  // }
+    // Check if start end switch is reached (Pin 21 - fully stacked dispenser)
+    if (digitalRead(startSwitchPin) == LOW) {
+      Serial.println("Start position reached. Motor stopped.");
+      break;
+    }
+  }
 }
 
 void executeCalibrationCycle() {
   Serial.println("Starting calibration routine...");
 
-  // --- STEP 1: Move forward until End Switch is reached (Pin 19) ---
-  setMotorDirection(true); // Set forward direction
+  setMotorDirection(true); 
   while (true) {
     digitalWrite(stepPin, HIGH);
     delayMicroseconds(1000);
@@ -130,8 +219,7 @@ void executeCalibrationCycle() {
 
   delay(500);
 
-  // --- STEP 2: Move reverse until Start Switch is reached (Pin 21) ---
-  setMotorDirection(false); // Set reverse direction
+  setMotorDirection(false); 
   while (true) {
     digitalWrite(stepPin, HIGH);
     delayMicroseconds(1000);
