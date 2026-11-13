@@ -49,15 +49,18 @@ pio device monitor --baud 115200
 3. Open the access point address shown in the serial monitor in a browser.
    The ESP32 normally uses `192.168.4.1` for its setup access point.
 4. Enter the Wi-Fi SSID and password, backend server IP address, and port
-   (default `8000`), then submit the form.
+   (default `8000`), then submit the form. After a successful connection, these
+   settings are saved in ESP32 preferences and reused on later boots. If no
+   saved settings exist or the saved Wi-Fi network cannot be reached, the
+   setup hotspot opens again. The form pre-fills the saved SSID and backend
+   address; enter the Wi-Fi password again when reconnecting.
 5. When connected, the setup access point is shut down. The device prints its
    Wi-Fi IP and tests the backend connection.
 
 The backend URL is assembled as `http://<server-ip>:<port>/api/v1`. Use the
 backend computer's LAN IP address, not `localhost` or `127.0.0.1`. The backend
 must be reachable from the ESP32 on the same network and listen on an
-externally reachable interface. Wi-Fi and backend settings are not retained
-for the next boot; the setup flow runs again each time.
+externally reachable interface.
 
 ## Operation
 
@@ -65,7 +68,8 @@ for the next boot; the setup flow runs again each time.
   values default to Motor 1.
 - Each motor has its own IR sensor. A dispense runs the selected motor toward
   its end switch. It stops early if that motor's IR sensor detects a medicine
-  drop, then returns the motor until that motor's start switch is triggered.
+  drop. Use the refill operation to return the selected motor to its start
+  switch.
 - Calibration moves the selected motor to its end switch and then homes it at
   its start switch.
 - The backend `TEST_IR` command reports the state of all three IR sensors.
@@ -84,6 +88,7 @@ The device provides these local endpoints after connecting to Wi-Fi:
 |---|---|---|
 | `GET` | `/api/status` | Returns the machine ID and online status |
 | `POST` | `/api/dispense` | Runs a dispense cycle; optionally provide `motor_channel` |
+| `POST` | `/api/refill` | Returns a motor to its start position; optionally provide `motor_channel` |
 
 Backend communication uses the `/api/v1/iot/poll/` path for polling and
 `/api/v1/logs/machine/` for machine logs. Requests authenticate with the

@@ -38,8 +38,8 @@ const unsigned long pollInterval = 5000;
 WebServer server(80);
 Preferences preferences;
 
-// Built from the IP and Port entered in the setup portal on every boot
-// (kept in RAM only, never saved). Result looks like: http://192.168.1.50:8000/api/v1
+// Built from the persisted backend IP and port. Result looks like:
+// http://192.168.1.50:8000/api/v1
 const String apiBasePath = "/api/v1";
 String backendServerUrl = "";
 bool onlineRoutesRegistered = false;
@@ -48,23 +48,27 @@ bool onlineRoutesRegistered = false;
 void setMotorDirection(int motorChannel, bool forward) {
   int dirPin = motors[motorChannel - 1].dirPin;
   if (INVERT_MOTOR_DIRECTION) {
-    digitalWrite(dirPin, forward ? LOW : HIGH);
-  } else {
     digitalWrite(dirPin, forward ? HIGH : LOW);
+  } else {
+    digitalWrite(dirPin, forward ? LOW : HIGH);
   }
 }
 
 // Forward declarations
 void executeDispenseCycle(int motorChannel);
+void executeRefill(int motorChannel);
 void executeCalibrationCycle(int motorChannel);
 void pollBackend();
 void sendMachineLog(String logType, String message);
 void handleApiDispense();
+void handleRefill();
 void handleRoot();
 void handleSaveCreds();
 void registerOnlineRoutes();
 String cleanHost(String host);
 void testBackendConnection();
+bool connectToWiFi(const String& ssid, const String& password);
+void startSetupPortal();
 
 // Cleans up the IP/host the user typed: trims spaces, strips http(s):// , any path and any :port
 String cleanHost(String host) {
@@ -90,11 +94,6 @@ void setup() {
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_AP_STA);
 
-  // Erase anything saved by older firmware (ssid, password, old server_url)
-  preferences.begin("med-config", false);
-  preferences.clear();
-  preferences.end();
-
   // Configure all motor pins
   for (int i = 0; i < 3; i++) {
     pinMode(motors[i].stepPin, OUTPUT);
@@ -110,16 +109,35 @@ void setup() {
     pinMode(endSwitchPins[i], INPUT_PULLUP);
   }
 
-  // Nothing is stored, so every boot starts the setup hotspot
-  Serial.println("Starting AP Hotspot for Setup...");
-  WiFi.softAP(("MedDispenser-Setup-" + machineId).c_str());
-  Serial.print("AP IP address: ");
-  Serial.println(WiFi.softAPIP());
+  preferences.begin("med-config", true);
+  String ssid = preferences.getString("ssid", "");
+  String password = preferences.getString("password", "");
+  String serverIp = preferences.getString("server_ip", "");
+  int serverPort = preferences.getInt("server_port", 8000);
+  preferences.end();
 
-  server.on("/", handleRoot);
-  server.on("/save", HTTP_POST, handleSaveCreds);
-  server.begin();
-  Serial.println("Med Dispenser Initialized. Waiting for setup.");
+  if (ssid.length() > 0 && serverIp.length() > 0 &&
+      serverPort >= 1 && serverPort <= 65535) {
+    backendServerUrl = "http://" + serverIp + ":" + String(serverPort) + apiBasePath;
+    Serial.printf("Trying saved Wi-Fi network: %s\n", ssid.c_str());
+    if (connectToWiFi(ssid, password)) {
+      Serial.println("\nWiFi Connected!");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+      WiFi.mode(WIFI_STA);
+      registerOnlineRoutes();
+      testBackendConnection();
+      server.begin();
+      Serial.println("Med Dispenser Initialized.");
+      return;
+    }
+
+    Serial.println("\nSaved Wi-Fi settings did not connect. Opening setup portal.");
+    WiFi.disconnect();
+    backendServerUrl = "";
+  }
+
+  startSetupPortal();
 }
 
 void loop() {
@@ -142,6 +160,7 @@ void registerOnlineRoutes() {
   onlineRoutesRegistered = true;
 
   server.on("/api/dispense", HTTP_POST, handleApiDispense);
+  server.on("/api/refill", HTTP_POST, handleRefill);
   server.on("/api/status", HTTP_GET, []() {
     server.send(200, "application/json", "{\"machineId\":\"" + machineId + "\", \"status\":\"online\"}");
   });
@@ -199,6 +218,9 @@ void pollBackend() {
         if (cmdType == "DISPENSE") {
           executeDispenseCycle(motorChannel);
           sendMachineLog("INFO", "Dispense cycle completed successfully on Motor " + String(motorChannel));
+        } else if (cmdType == "REFILL") {
+          executeRefill(motorChannel);
+          sendMachineLog("INFO", "Refill cycle completed successfully on Motor " + String(motorChannel));
         } else if (cmdType == "CALIBRATE") {
           executeCalibrationCycle(motorChannel);
           sendMachineLog("INFO", "Calibration routine completed successfully on Motor " + String(motorChannel));
@@ -253,11 +275,16 @@ void handleRoot() {
   String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
   html += "<h2>Med Dispenser Setup (" + machineId + ")</h2>";
   html += "<form action=\"/save\" method=\"POST\">";
-  html += "Wi-Fi SSID:<br><input type=\"text\" name=\"ssid\" required><br><br>";
+  preferences.begin("med-config", true);
+  String savedSsid = preferences.getString("ssid", "");
+  String savedServerIp = preferences.getString("server_ip", "");
+  int savedServerPort = preferences.getInt("server_port", 8000);
+  preferences.end();
+  html += "Wi-Fi SSID:<br><input type=\"text\" name=\"ssid\" value=\"" + savedSsid + "\" required><br><br>";
   html += "Wi-Fi Password:<br><input type=\"password\" name=\"password\"><br><br>";
-  html += "Backend Server IP:<br><input type=\"text\" name=\"server_ip\" placeholder=\"192.168.1.100\" required><br>";
+  html += "Backend Server IP:<br><input type=\"text\" name=\"server_ip\" value=\"" + savedServerIp + "\" placeholder=\"192.168.1.100\" required><br>";
   html += "<small>Your computer's IP on the same Wi-Fi network (not localhost).</small><br><br>";
-  html += "Backend Server Port:<br><input type=\"number\" name=\"server_port\" value=\"8000\" min=\"1\" max=\"65535\" required><br><br>";
+  html += "Backend Server Port:<br><input type=\"number\" name=\"server_port\" value=\"" + String(savedServerPort) + "\" min=\"1\" max=\"65535\" required><br><br>";
   html += "<input type=\"submit\" value=\"Save & Connect\">";
   html += "</form></body></html>";
   server.send(200, "text/html", html);
@@ -274,7 +301,6 @@ void handleSaveCreds() {
     return;
   }
 
-  // Kept in RAM only. Nothing here is written to flash.
   backendServerUrl = "http://" + serverIp + ":" + String(serverPort) + apiBasePath;
   Serial.printf("Backend URL set to: %s\n", backendServerUrl.c_str());
 
@@ -286,18 +312,17 @@ void handleSaveCreds() {
   delay(500);
 
   Serial.printf("Connecting to WiFi: %s\n", ssid.c_str());
-  WiFi.begin(ssid.c_str(), password.c_str());
-
-  unsigned long startAttemptTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
+  if (connectToWiFi(ssid, password)) {
     Serial.println("\nWiFi Connected!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
+
+    preferences.begin("med-config", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+    preferences.putString("server_ip", serverIp);
+    preferences.putInt("server_port", serverPort);
+    preferences.end();
 
     WiFi.softAPdisconnect(true); // Close the setup hotspot
     WiFi.mode(WIFI_STA);
@@ -308,6 +333,31 @@ void handleSaveCreds() {
     WiFi.disconnect();
     backendServerUrl = "";
   }
+}
+
+bool connectToWiFi(const String& ssid, const String& password) {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void startSetupPortal() {
+  WiFi.mode(WIFI_AP_STA);
+  Serial.println("Starting AP Hotspot for Setup...");
+  WiFi.softAP(("MedDispenser-Setup-" + machineId).c_str());
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSaveCreds);
+  server.begin();
+  Serial.println("Med Dispenser Initialized. Waiting for setup.");
 }
 
 void handleApiDispense() {
@@ -328,6 +378,26 @@ void handleApiDispense() {
   systemBusy = false;
 
   server.send(200, "application/json", "{\"success\":true,\"message\":\"Dispense cycle completed\",\"motor_channel\":" + String(motorChannel) + ",\"machineId\":\"" + machineId + "\"}");
+}
+
+void handleRefill() {
+  if (systemBusy) {
+    server.send(503, "application/json", "{\"error\":\"System busy\"}");
+    return;
+  }
+
+  int motorChannel = 1;
+  if (server.hasArg("motor_channel")) {
+    motorChannel = server.arg("motor_channel").toInt();
+    if (motorChannel < 1 || motorChannel > 3) motorChannel = 1;
+  }
+
+  Serial.printf("Local API Refill command received for Motor %d.\n", motorChannel);
+  systemBusy = true;
+  executeRefill(motorChannel);
+  systemBusy = false;
+
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Refill cycle completed\",\"motor_channel\":" + String(motorChannel) + ",\"machineId\":\"" + machineId + "\"}");
 }
 
 void executeDispenseCycle(int motorChannel) {
@@ -357,11 +427,14 @@ void executeDispenseCycle(int motorChannel) {
     }
   }
 
-  delay(500);
+}
 
-  // Return to starting position (Reverse direction)
+void executeRefill(int motorChannel) {
+  int motorIndex = motorChannel - 1;
+  int stepPin = motors[motorIndex].stepPin;
+
   setMotorDirection(motorChannel, false);
-  Serial.println("Returning to starting position...");
+  Serial.printf("Refilling using Motor %d...\n", motorChannel);
 
   while (true) {
     digitalWrite(stepPin, HIGH);
@@ -369,9 +442,8 @@ void executeDispenseCycle(int motorChannel) {
     digitalWrite(stepPin, LOW);
     delayMicroseconds(1000);
 
-    // Check if start switch is reached (fully stacked dispenser)
     if (digitalRead(startSwitchPins[motorIndex]) == LOW) {
-      Serial.printf("Start position reached for Motor %d. Motor stopped.\n", motorChannel);
+      Serial.printf("Start position reached for Motor %d. Refill complete.\n", motorChannel);
       break;
     }
   }
